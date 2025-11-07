@@ -1,3 +1,11 @@
+//! Binary that bridges ZeroMQ SMS ingestion with AWS SNS publishing.
+//!
+//! The service consumes JSON-encoded SMS payloads from a ZeroMQ `SUB` socket,
+//! validates each request, and forwards it to Amazon SNS for delivery. It runs
+//! on Tokio with asynchronous concurrency limits, relies on ZeroMQ and AWS
+//! credentials provided through environment variables, and gracefully shuts
+//! down in response to `SIGINT`/`SIGTERM`.
+
 use std::{env, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use aws_config::BehaviorVersion;
@@ -8,7 +16,21 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Semaphore, broadcast};
 
+/// Environment variable defining the ZeroMQ endpoint used for SMS intake.
+/// Defaults to `tcp://127.0.0.1:5562` when unset, matching the local dev
+/// configuration in docker-compose.
+const ENV_ZMQ_SMS_SUB: &str = "ZMQ_SMS_SUB";
+
+/// Environment variable limiting how many SMS publish tasks can run at once.
+/// Accepts a positive integer and defaults to `100` to provide ample
+/// concurrency without overwhelming the downstream SNS service.
+const ENV_MAX_CONCURRENT_SMS: &str = "MAX_CONCURRENT_SMS";
+
 #[derive(Error, Debug)]
+/// Errors that can occur while accepting, validating, or publishing SMS jobs.
+///
+/// Each variant wraps the underlying library error when available so callers
+/// receive structured context suitable for logging or retry decisions.
 pub enum ServiceError {
     #[error("ZeroMQ communication error")]
     Zmq(#[from] zmq::Error),
@@ -25,6 +47,11 @@ pub enum ServiceError {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+/// JSON payload representing a request to send a single SMS message.
+///
+/// The payload is provided by the ZeroMQ producer and must contain a
+/// non-empty sender ID, a valid E.164-formatted phone number, and a message
+/// body. Validation ensures these requirements before any publish occurs.
 pub struct ZMQSendSmsMessage {
     pub sender_id: String,
     pub phone_number: String,
@@ -65,6 +92,16 @@ impl ZMQSendSmsMessage {
     }
 }
 
+/// Publishes a validated SMS payload to Amazon SNS.
+///
+/// * `msg` - The SMS request received from ZeroMQ. It is validated prior to
+///   publishing; validation errors are surfaced to the caller as
+///   [`ServiceError`].
+/// * `client` - The SNS client used to send the message. Any publish or
+///   request-building issues are propagated via the corresponding
+///   [`ServiceError`] variants.
+///
+/// Returns `Ok(())` after the SNS publish completes successfully.
 async fn send_sms(msg: ZMQSendSmsMessage, client: &Client) -> Result<(), ServiceError> {
     msg.validate()?;
 
@@ -87,16 +124,20 @@ async fn send_sms(msg: ZMQSendSmsMessage, client: &Client) -> Result<(), Service
 }
 
 #[derive(Clone, Debug)]
+/// Configuration values that govern runtime connectivity and concurrency.
 pub struct ServiceConfig {
     pub zmq_endpoint: String,
     pub max_concurrent_sms: usize,
 }
 
 impl ServiceConfig {
+    /// Loads configuration using environment variables documented in
+    /// [`ENV_ZMQ_SMS_SUB`] and [`ENV_MAX_CONCURRENT_SMS`], falling back to
+    /// sensible local defaults when keys are missing or malformed.
     pub fn from_env() -> Self {
         let zmq_endpoint =
-            env::var("ZMQ_SMS_SUB").unwrap_or_else(|_| "tcp://127.0.0.1:5562".into());
-        let max_concurrent_sms = env::var("MAX_CONCURRENT_SMS")
+            env::var(ENV_ZMQ_SMS_SUB).unwrap_or_else(|_| "tcp://127.0.0.1:5562".into());
+        let max_concurrent_sms = env::var(ENV_MAX_CONCURRENT_SMS)
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100);
@@ -162,6 +203,21 @@ impl MessageSource for ZmqMessageSource {
     }
 }
 
+/// Main event loop that converts ZeroMQ messages into SNS publish tasks.
+///
+/// * `source` - Non-blocking message source used to poll ZeroMQ. Any transport
+///   errors are surfaced through [`ServiceError::Zmq`].
+/// * `publisher` - SMS publisher implementation (typically SNS) used to send
+///   validated requests. Publish and validation failures are logged and
+///   propagated to the task.
+/// * `config` - Runtime configuration controlling the ZeroMQ endpoint and
+///   concurrency limits.
+/// * `shutdown` - Broadcast channel that signals a graceful stop when a value
+///   arrives.
+///
+/// Returns `Ok(())` when the shutdown signal is observed and the loop exits
+/// cleanly. Upstream errors are propagated so callers can perform additional
+/// recovery or restart logic.
 pub async fn run_service<S, P>(
     mut source: S,
     publisher: Arc<P>,
