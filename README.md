@@ -22,6 +22,7 @@ AWS_SECRET_ACCESS_KEY=your_secret_key
 AWS_REGION=your_region
 AWS_ENDPOINT_URL=https://notifications.yandexcloud.net/
 ZMQ_SMS_SUB=tcp://127.0.0.1:5562
+MAX_CONCURRENT_SMS=100
 ```
 
 ## Message Format

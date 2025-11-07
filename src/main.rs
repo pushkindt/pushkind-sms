@@ -6,7 +6,7 @@ use dotenvy::dotenv;
 use phonenumber::parse;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 
 #[derive(Error, Debug)]
 enum ServiceError {
@@ -34,9 +34,7 @@ struct ZMQSendSmsMessage {
 impl ZMQSendSmsMessage {
     fn validate(&self) -> Result<(), ServiceError> {
         if self.sender_id.is_empty() {
-            return Err(ServiceError::InvalidMessage(
-                "sender_id is empty".to_string(),
-            ));
+            return Err(ServiceError::InvalidMessage("sender_id is empty".into()));
         }
         let phone = parse(None, &self.phone_number)?;
         if !phone.is_valid() {
@@ -45,9 +43,25 @@ impl ZMQSendSmsMessage {
             ));
         }
         if self.message.is_empty() {
-            return Err(ServiceError::InvalidMessage("message is empty".to_string()));
+            return Err(ServiceError::InvalidMessage("message is empty".into()));
         }
         Ok(())
+    }
+
+    fn mask_phone(&self) -> String {
+        self.phone_number
+            .chars()
+            .take(4)
+            .chain(
+                self.phone_number
+                    .chars()
+                    .rev()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            )
+            .collect()
     }
 }
 
@@ -67,16 +81,17 @@ async fn send_sms(msg: ZMQSendSmsMessage, client: &Client) -> Result<(), Service
         .send()
         .await
         .map_err(|e| ServiceError::Publish(Box::new(e)))?;
-    log::info!(
-        "Published SMS to {}...{}",
-        &msg.phone_number[..4],
-        &msg.phone_number[msg.phone_number.len() - 2..]
-    );
+    
+    log::info!("Published SMS to {}", msg.mask_phone());
     Ok(())
 }
 
 async fn run_service(mut shutdown: broadcast::Receiver<()>) -> Result<(), ServiceError> {
-    let zmq_address = env::var("ZMQ_SMS_SUB").unwrap_or("tcp://127.0.0.1:5562".to_string());
+    let zmq_address = env::var("ZMQ_SMS_SUB").unwrap_or_else(|_| "tcp://127.0.0.1:5562".into());
+    let max_concurrent = env::var("MAX_CONCURRENT_SMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
 
     let context = zmq::Context::new();
     let responder = context.socket(zmq::SUB)?;
@@ -85,8 +100,9 @@ async fn run_service(mut shutdown: broadcast::Receiver<()>) -> Result<(), Servic
 
     let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let client = Arc::new(Client::new(&config));
+    let semaphore = Arc::new(Semaphore::new(max_concurrent));
 
-    log::info!("Starting sms sending worker at {zmq_address}");
+    log::info!("Starting sms sending worker at {zmq_address} (max concurrent: {max_concurrent})");
 
     loop {
         if shutdown.try_recv().is_ok() {
@@ -105,18 +121,15 @@ async fn run_service(mut shutdown: broadcast::Receiver<()>) -> Result<(), Servic
 
         match serde_json::from_slice::<ZMQSendSmsMessage>(&msg) {
             Ok(msg) => {
-                log::info!(
-                    "Received SMS request for {}...{}",
-                    &msg.phone_number[..std::cmp::min(4, msg.phone_number.len())],
-                    if msg.phone_number.len() > 2 {
-                        &msg.phone_number[msg.phone_number.len() - 2..]
-                    } else {
-                        ""
-                    }
-                );
+                log::info!("Received SMS request for {}", msg.mask_phone());
 
                 let client = client.clone();
+                let semaphore = semaphore.clone();
                 tokio::spawn(async move {
+                    let Ok(_permit) = semaphore.acquire().await else {
+                        log::error!("Semaphore closed, cannot send SMS");
+                        return;
+                    };
                     if let Err(e) = send_sms(msg, &client).await {
                         log::error!("Error sending sms message: {e}");
                     }
@@ -143,16 +156,14 @@ async fn main() {
         }
     });
 
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to setup SIGTERM handler");
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             log::info!("Received SIGINT, shutting down");
         }
-        _ = async {
-            let _ = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("Failed to setup SIGTERM handler")
-                .recv()
-                .await;
-        } => {
+        _ = sigterm.recv() => {
             log::info!("Received SIGTERM, shutting down");
         }
     }
