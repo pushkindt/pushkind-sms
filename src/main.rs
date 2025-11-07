@@ -9,7 +9,7 @@ use thiserror::Error;
 use tokio::sync::{Semaphore, broadcast};
 
 #[derive(Error, Debug)]
-enum ServiceError {
+pub enum ServiceError {
     #[error("ZeroMQ communication error")]
     Zmq(#[from] zmq::Error),
     #[error("SNS Publish error")]
@@ -24,15 +24,15 @@ enum ServiceError {
     InvalidPhoneNumber(#[from] phonenumber::ParseError),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct ZMQSendSmsMessage {
-    sender_id: String,
-    phone_number: String,
-    message: String,
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ZMQSendSmsMessage {
+    pub sender_id: String,
+    pub phone_number: String,
+    pub message: String,
 }
 
 impl ZMQSendSmsMessage {
-    fn validate(&self) -> Result<(), ServiceError> {
+    pub fn validate(&self) -> Result<(), ServiceError> {
         if self.sender_id.is_empty() {
             return Err(ServiceError::InvalidMessage("sender_id is empty".into()));
         }
@@ -48,7 +48,7 @@ impl ZMQSendSmsMessage {
         Ok(())
     }
 
-    fn mask_phone(&self) -> String {
+    pub fn mask_phone(&self) -> String {
         self.phone_number
             .chars()
             .take(4)
@@ -171,4 +171,109 @@ async fn main() {
     let _ = shutdown_tx.send(());
     let _ = service_handle.await;
     log::info!("Service stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_message_passes_validation() {
+        let msg = ZMQSendSmsMessage {
+            sender_id: "TEST".into(),
+            phone_number: "+12345678901".into(),
+            message: "Test message".into(),
+        };
+        assert!(msg.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_sender_id_fails_validation() {
+        let msg = ZMQSendSmsMessage {
+            sender_id: "".into(),
+            phone_number: "+1234567890".into(),
+            message: "Test".into(),
+        };
+        assert!(matches!(
+            msg.validate(),
+            Err(ServiceError::InvalidMessage(_))
+        ));
+    }
+
+    #[test]
+    fn empty_message_fails_validation() {
+        let msg = ZMQSendSmsMessage {
+            sender_id: "TEST".into(),
+            phone_number: "+12345678901".into(),
+            message: "".into(),
+        };
+        assert!(matches!(
+            msg.validate(),
+            Err(ServiceError::InvalidMessage(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_phone_number_fails_validation() {
+        let msg = ZMQSendSmsMessage {
+            sender_id: "TEST".into(),
+            phone_number: "invalid".into(),
+            message: "Test".into(),
+        };
+        assert!(matches!(
+            msg.validate(),
+            Err(ServiceError::InvalidPhoneNumber(_))
+        ));
+    }
+
+    #[test]
+    fn phone_masking_works() {
+        let msg = ZMQSendSmsMessage {
+            sender_id: "TEST".into(),
+            phone_number: "+12345678901".into(),
+            message: "Test".into(),
+        };
+        assert_eq!(msg.mask_phone(), "+12301");
+    }
+
+    #[test]
+    fn phone_masking_short_number() {
+        let msg = ZMQSendSmsMessage {
+            sender_id: "TEST".into(),
+            phone_number: "+123".into(),
+            message: "Test".into(),
+        };
+        assert_eq!(msg.mask_phone(), "+12323");
+    }
+
+    #[test]
+    fn deserialize_valid_json() {
+        let json = r#"{"sender_id":"TEST","phone_number":"+12345678901","message":"Hello"}"#;
+        let msg: Result<ZMQSendSmsMessage, _> = serde_json::from_str(json);
+        assert!(msg.is_ok());
+        let msg = msg.unwrap();
+        assert_eq!(msg.sender_id, "TEST");
+        assert_eq!(msg.phone_number, "+12345678901");
+        assert_eq!(msg.message, "Hello");
+    }
+
+    #[test]
+    fn deserialize_invalid_json_fails() {
+        let json = r#"{"sender_id":"TEST"}"#;
+        let msg: Result<ZMQSendSmsMessage, _> = serde_json::from_str(json);
+        assert!(msg.is_err());
+    }
+
+    #[test]
+    fn serialize_message() {
+        let msg = ZMQSendSmsMessage {
+            sender_id: "TEST".into(),
+            phone_number: "+12345678901".into(),
+            message: "Hello".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("TEST"));
+        assert!(json.contains("+12345678901"));
+        assert!(json.contains("Hello"));
+    }
 }
