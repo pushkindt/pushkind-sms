@@ -76,19 +76,15 @@ impl ZMQSendSmsMessage {
     }
 
     pub fn mask_phone(&self) -> String {
-        self.phone_number
-            .chars()
-            .take(4)
-            .chain(
-                self.phone_number
-                    .chars()
-                    .rev()
-                    .take(2)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev(),
-            )
-            .collect()
+        let mut s = self.phone_number.chars();
+
+        let keep_start = 4;
+
+        let mut out = String::new();
+        out.extend(s.by_ref().take(keep_start));
+        out.extend(std::iter::repeat('*').take(6));
+        out.extend(s.skip(6));
+        out
     }
 }
 
