@@ -1,0 +1,47 @@
+name: Deploy development
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --all-features
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pushkind-sms
+          path: |
+            ./target/release/pushkind-sms
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: pushkind-hedwig
+          path: ./target/release/
+      - name: Install SSH Key
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.CICD_PRIVATE_KEY }}
+          name: id_rsa # optional
+          known_hosts: ${{ secrets.CICD_KNOWN_HOSTS }}
+          if_key_exists: fail # replace / ignore / fail; optional (defaults to fail)
+      - name: Deploy
+        run: |
+          ssh cicd@orders.pushkind.com "sudo /usr/bin/systemctl stop pushkind-sms.service"
+          scp ./target/release/pushkind-sms cicd@orders.pushkind.com:/var/www11/html/
+          ssh cicd@orders.pushkind.com "sudo /usr/bin/systemctl start pushkind-sms.service"
