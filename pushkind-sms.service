@@ -1,0 +1,36 @@
+[Unit]
+Description=pushkind-sms (worker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=www-data11
+Group=www-data
+
+WorkingDirectory=/var/www11/html
+ExecStart=/var/www11/html/pushkind-sms
+
+Restart=on-failure
+RestartSec=2
+
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Logging
+# StandardOutput=append:/var/log/pushkind/pushkind-sms.log
+# StandardError=inherit
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/www11/html
+AmbientCapabilities=
+CapabilityBoundingSet=
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
