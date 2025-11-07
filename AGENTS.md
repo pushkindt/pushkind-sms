@@ -1,7 +1,13 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-This workspace is a single Rust crate (`Cargo.toml`, edition 2024). Core logic lives in `src/main.rs`, which wires ZeroMQ ingestion, AWS SNS publishing, and logging. Add shared helpers under `src/` using modules (e.g., `src/publisher.rs`) and keep binary-specific wiring in `main.rs`. Build artifacts land in `target/`; place integration tests in `tests/` when functionality grows, and sample payloads or fixtures under `fixtures/`.
+This workspace is a single Rust crate (`Cargo.toml`, edition 2024). Core logic lives in `src/lib.rs` (see `run()`), which wires ZeroMQ ingestion, AWS SNS publishing, and logging; `src/main.rs` is a thin Tokio entry point that delegates to the library. Add shared helpers under `src/` using modules (e.g., `src/publisher.rs`) and keep binary-specific wiring in `main.rs`. Build artifacts land in `target/`; place integration tests in `tests/` when functionality grows, and sample payloads or fixtures under `fixtures/`.
+
+## Rust Quality Expectations
+- Every change should raise the quality bar: prioritize readability, maintainability, and predictable error handling.
+- Leave the codebase more idiomatic than you found it—refactor opportunistically, remove `unwrap()`s, and keep APIs narrow with focused traits/structs.
+- Thread safety and async correctness are table stakes. Use `Send + Sync` bounds consciously and exercise backpressure-friendly patterns rather than spawning unchecked tasks.
+- Always pair logic changes with tests that prove behavior and guard against regressions; use property tests or fixtures when serialization/deserialization is involved.
 
 ## Build, Test, and Development Commands
 - `cargo run --bin pushkind-sms` loads `.env`, subscribes to `ZMQ_SMS_SUB`, and publishes a sample SMS via SNS.
