@@ -82,7 +82,7 @@ impl ZMQSendSmsMessage {
 
         let mut out = String::new();
         out.extend(s.by_ref().take(keep_start));
-        out.extend(std::iter::repeat('*').take(6));
+        out.extend(std::iter::repeat_n('*', 6));
         out.extend(s.skip(6));
         out
     }
@@ -513,7 +513,7 @@ mod tests {
             phone_number: "+12345678901".into(),
             message: "Test".into(),
         };
-        assert_eq!(msg.mask_phone(), "+12301");
+        assert_eq!(msg.mask_phone(), "+123******01");
     }
 
     #[test]
@@ -523,7 +523,7 @@ mod tests {
             phone_number: "+123".into(),
             message: "Test".into(),
         };
-        assert_eq!(msg.mask_phone(), "+12323");
+        assert_eq!(msg.mask_phone(), "+123******");
     }
 
     #[test]
