@@ -1,6 +1,3 @@
-use serde_json;
-use zmq;
-
 #[test]
 fn zmq_message_serialization() {
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
@@ -27,31 +24,4 @@ fn zmq_context_creation() {
     let context = zmq::Context::new();
     let socket = context.socket(zmq::PUB);
     assert!(socket.is_ok());
-}
-
-#[test]
-fn parse_max_concurrent_from_env() {
-    unsafe {
-        std::env::set_var("MAX_CONCURRENT_SMS", "50");
-    }
-    let max_concurrent = std::env::var("MAX_CONCURRENT_SMS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(100);
-    assert_eq!(max_concurrent, 50);
-    unsafe {
-        std::env::remove_var("MAX_CONCURRENT_SMS");
-    }
-}
-
-#[test]
-fn parse_max_concurrent_default() {
-    unsafe {
-        std::env::remove_var("MAX_CONCURRENT_SMS");
-    }
-    let max_concurrent = std::env::var("MAX_CONCURRENT_SMS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(100);
-    assert_eq!(max_concurrent, 100);
 }
