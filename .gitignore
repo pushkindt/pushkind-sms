@@ -1,2 +1,4 @@
 /target
 .env
+*.py
+.python-version
