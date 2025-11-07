@@ -76,21 +76,15 @@ impl ZMQSendSmsMessage {
     }
 
     pub fn mask_phone(&self) -> String {
-        let masked_len = std::cmp::max(self.phone_number.len().saturating_sub(6), 6);
-        self.phone_number
-            .chars()
-            .take(4)
-            .chain(std::iter::repeat_n('*', masked_len))
-            .chain(
-                self.phone_number
-                    .chars()
-                    .rev()
-                    .take(2)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev(),
-            )
-            .collect()
+        let mut s = self.phone_number.chars();
+
+        let keep_start = 4;
+
+        let mut out = String::new();
+        out.extend(s.by_ref().take(keep_start));
+        out.extend(std::iter::repeat('*').take(6));
+        out.extend(s.skip(6));
+        out
     }
 }
 
@@ -395,7 +389,7 @@ mod tests {
             phone_number: "+123".into(),
             message: "Test".into(),
         };
-        assert_eq!(msg.mask_phone(), "+123******23");
+        assert_eq!(msg.mask_phone(), "+123******");
     }
 
     #[test]
