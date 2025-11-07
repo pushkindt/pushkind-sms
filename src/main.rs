@@ -1,4 +1,4 @@
-use std::{env, sync::Arc};
+use std::{env, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_sns::{Client, types::MessageAttributeValue};
@@ -81,28 +81,104 @@ async fn send_sms(msg: ZMQSendSmsMessage, client: &Client) -> Result<(), Service
         .send()
         .await
         .map_err(|e| ServiceError::Publish(Box::new(e)))?;
-    
+
     log::info!("Published SMS to {}", msg.mask_phone());
     Ok(())
 }
 
-async fn run_service(mut shutdown: broadcast::Receiver<()>) -> Result<(), ServiceError> {
-    let zmq_address = env::var("ZMQ_SMS_SUB").unwrap_or_else(|_| "tcp://127.0.0.1:5562".into());
-    let max_concurrent = env::var("MAX_CONCURRENT_SMS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
+#[derive(Clone, Debug)]
+pub struct ServiceConfig {
+    pub zmq_endpoint: String,
+    pub max_concurrent_sms: usize,
+}
 
-    let context = zmq::Context::new();
-    let responder = context.socket(zmq::SUB)?;
-    responder.connect(&zmq_address)?;
-    responder.set_subscribe(b"")?;
+impl ServiceConfig {
+    pub fn from_env() -> Self {
+        let zmq_endpoint =
+            env::var("ZMQ_SMS_SUB").unwrap_or_else(|_| "tcp://127.0.0.1:5562".into());
+        let max_concurrent_sms = env::var("MAX_CONCURRENT_SMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
 
-    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let client = Arc::new(Client::new(&config));
-    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+        Self {
+            zmq_endpoint,
+            max_concurrent_sms,
+        }
+    }
+}
 
-    log::info!("Starting sms sending worker at {zmq_address} (max concurrent: {max_concurrent})");
+pub trait SmsPublisher: Send + Sync + 'static {
+    fn publish(
+        &self,
+        msg: ZMQSendSmsMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + '_>>;
+}
+
+pub trait MessageSource: Send {
+    fn try_next(&mut self) -> Result<Option<Vec<u8>>, ServiceError>;
+}
+
+pub struct SnsPublisher {
+    client: Client,
+}
+
+impl SnsPublisher {
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+}
+
+impl SmsPublisher for SnsPublisher {
+    fn publish(
+        &self,
+        msg: ZMQSendSmsMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + '_>> {
+        let client = self.client.clone();
+        Box::pin(async move { send_sms(msg, &client).await })
+    }
+}
+
+pub struct ZmqMessageSource {
+    socket: zmq::Socket,
+}
+
+impl ZmqMessageSource {
+    pub fn connect(context: &zmq::Context, endpoint: &str) -> Result<Self, ServiceError> {
+        let socket = context.socket(zmq::SUB)?;
+        socket.connect(endpoint)?;
+        socket.set_subscribe(b"")?;
+        Ok(Self { socket })
+    }
+}
+
+impl MessageSource for ZmqMessageSource {
+    fn try_next(&mut self) -> Result<Option<Vec<u8>>, ServiceError> {
+        match self.socket.recv_bytes(zmq::DONTWAIT) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(zmq::Error::EAGAIN) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+pub async fn run_service<S, P>(
+    mut source: S,
+    publisher: Arc<P>,
+    config: ServiceConfig,
+    mut shutdown: broadcast::Receiver<()>,
+) -> Result<(), ServiceError>
+where
+    S: MessageSource,
+    P: SmsPublisher,
+{
+    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_sms));
+
+    log::info!(
+        "Starting sms sending worker at {} (max concurrent: {})",
+        config.zmq_endpoint,
+        config.max_concurrent_sms
+    );
 
     loop {
         if shutdown.try_recv().is_ok() {
@@ -110,27 +186,26 @@ async fn run_service(mut shutdown: broadcast::Receiver<()>) -> Result<(), Servic
             break;
         }
 
-        let msg = match responder.recv_bytes(zmq::DONTWAIT) {
-            Ok(msg) => msg,
-            Err(zmq::Error::EAGAIN) => {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        let msg = match source.try_next()? {
+            Some(msg) => msg,
+            None => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }
-            Err(e) => return Err(e.into()),
         };
 
         match serde_json::from_slice::<ZMQSendSmsMessage>(&msg) {
             Ok(msg) => {
                 log::info!("Received SMS request for {}", msg.mask_phone());
 
-                let client = client.clone();
+                let publisher = Arc::clone(&publisher);
                 let semaphore = semaphore.clone();
                 tokio::spawn(async move {
                     let Ok(_permit) = semaphore.acquire().await else {
                         log::error!("Semaphore closed, cannot send SMS");
                         return;
                     };
-                    if let Err(e) = send_sms(msg, &client).await {
+                    if let Err(e) = publisher.publish(msg).await {
                         log::error!("Error sending sms message: {e}");
                     }
                 });
@@ -148,13 +223,30 @@ async fn main() {
     dotenv().ok();
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
 
+    let config = ServiceConfig::from_env();
+    let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let publisher = Arc::new(SnsPublisher::new(Client::new(&aws_config)));
+
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-    let service_handle = tokio::spawn(async move {
-        if let Err(e) = run_service(shutdown_rx).await {
-            log::error!("Error running service: {e}");
-        }
-    });
+    let service_handle = {
+        let publisher = Arc::clone(&publisher);
+        let config = config.clone();
+        tokio::spawn(async move {
+            let context = zmq::Context::new();
+            let source = match ZmqMessageSource::connect(&context, &config.zmq_endpoint) {
+                Ok(source) => source,
+                Err(e) => {
+                    log::error!("Failed to connect to ZeroMQ source: {e}");
+                    return;
+                }
+            };
+
+            if let Err(e) = run_service(source, publisher, config, shutdown_rx).await {
+                log::error!("Error running service: {e}");
+            }
+        })
+    };
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("Failed to setup SIGTERM handler");
@@ -176,6 +268,8 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     #[test]
     fn valid_message_passes_validation() {
@@ -275,5 +369,262 @@ mod tests {
         assert!(json.contains("TEST"));
         assert!(json.contains("+12345678901"));
         assert!(json.contains("Hello"));
+    }
+
+    struct FakeSource {
+        messages: Vec<Vec<u8>>,
+        index: usize,
+    }
+
+    impl FakeSource {
+        fn new(messages: Vec<Vec<u8>>) -> Self {
+            Self { messages, index: 0 }
+        }
+    }
+
+    impl MessageSource for FakeSource {
+        fn try_next(&mut self) -> Result<Option<Vec<u8>>, ServiceError> {
+            if let Some(msg) = self.messages.get(self.index).cloned() {
+                self.index += 1;
+                Ok(Some(msg))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingState {
+        active: usize,
+        max_active: usize,
+        messages: Vec<ZMQSendSmsMessage>,
+    }
+
+    struct RecordingPublisher {
+        state: Arc<Mutex<RecordingState>>,
+        delay: Duration,
+    }
+
+    impl RecordingPublisher {
+        fn new(delay: Duration) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(RecordingState::default())),
+                delay,
+            }
+        }
+
+        async fn wait_for_messages(&self, expected: usize) {
+            for _ in 0..100 {
+                if self.messages().await.len() >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("Timed out waiting for messages");
+        }
+
+        async fn messages(&self) -> Vec<ZMQSendSmsMessage> {
+            self.state.lock().await.messages.clone()
+        }
+
+        async fn max_active(&self) -> usize {
+            self.state.lock().await.max_active
+        }
+    }
+
+    impl SmsPublisher for RecordingPublisher {
+        fn publish(
+            &self,
+            msg: ZMQSendSmsMessage,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + '_>> {
+            let state = Arc::clone(&self.state);
+            let delay = self.delay;
+            Box::pin(async move {
+                {
+                    let mut guard = state.lock().await;
+                    guard.active += 1;
+                    guard.max_active = guard.max_active.max(guard.active);
+                }
+
+                tokio::time::sleep(delay).await;
+
+                let mut guard = state.lock().await;
+                guard.active = guard.active.saturating_sub(1);
+                guard.messages.push(msg);
+                Ok(())
+            })
+        }
+    }
+
+    struct FlakyState {
+        failures_remaining: usize,
+        attempts: usize,
+        successes: usize,
+    }
+
+    struct FlakyPublisher {
+        state: Arc<Mutex<FlakyState>>,
+    }
+
+    impl FlakyPublisher {
+        fn new(failures: usize) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FlakyState {
+                    failures_remaining: failures,
+                    attempts: 0,
+                    successes: 0,
+                })),
+            }
+        }
+
+        async fn wait_for_attempts(&self, expected: usize) {
+            for _ in 0..100 {
+                if self.state.lock().await.attempts >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("Timed out waiting for attempts");
+        }
+
+        async fn attempts(&self) -> usize {
+            self.state.lock().await.attempts
+        }
+
+        async fn successes(&self) -> usize {
+            self.state.lock().await.successes
+        }
+    }
+
+    impl SmsPublisher for FlakyPublisher {
+        fn publish(
+            &self,
+            _msg: ZMQSendSmsMessage,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + '_>> {
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                let mut guard = state.lock().await;
+                guard.attempts += 1;
+                if guard.failures_remaining > 0 {
+                    guard.failures_remaining -= 1;
+                    return Err(ServiceError::InvalidMessage("forced failure".into()));
+                }
+                guard.successes += 1;
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_service_processes_messages_with_concurrency_limit() {
+        let messages = vec![
+            serde_json::to_vec(&ZMQSendSmsMessage {
+                sender_id: "TEST1".into(),
+                phone_number: "+12345678901".into(),
+                message: "Hello".into(),
+            })
+            .unwrap(),
+            serde_json::to_vec(&ZMQSendSmsMessage {
+                sender_id: "TEST2".into(),
+                phone_number: "+12345678902".into(),
+                message: "World".into(),
+            })
+            .unwrap(),
+            serde_json::to_vec(&ZMQSendSmsMessage {
+                sender_id: "TEST3".into(),
+                phone_number: "+12345678903".into(),
+                message: "Again".into(),
+            })
+            .unwrap(),
+        ];
+
+        let source = FakeSource::new(messages);
+        let publisher = Arc::new(RecordingPublisher::new(Duration::from_millis(20)));
+        let config = ServiceConfig {
+            zmq_endpoint: "inproc://test".into(),
+            max_concurrent_sms: 2,
+        };
+
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let service = tokio::spawn(run_service(
+            source,
+            Arc::clone(&publisher),
+            config,
+            shutdown_rx,
+        ));
+
+        publisher.wait_for_messages(3).await;
+        let _ = shutdown_tx.send(());
+
+        service.await.unwrap().unwrap();
+
+        assert_eq!(publisher.messages().await.len(), 3);
+        assert!(publisher.max_active().await <= 2);
+    }
+
+    #[tokio::test]
+    async fn run_service_handles_publisher_errors() {
+        let messages = vec![
+            serde_json::to_vec(&ZMQSendSmsMessage {
+                sender_id: "TEST1".into(),
+                phone_number: "+12345678901".into(),
+                message: "Hello".into(),
+            })
+            .unwrap(),
+            serde_json::to_vec(&ZMQSendSmsMessage {
+                sender_id: "TEST2".into(),
+                phone_number: "+12345678902".into(),
+                message: "World".into(),
+            })
+            .unwrap(),
+        ];
+
+        let source = FakeSource::new(messages);
+        let publisher = Arc::new(FlakyPublisher::new(1));
+        let config = ServiceConfig {
+            zmq_endpoint: "inproc://test".into(),
+            max_concurrent_sms: 1,
+        };
+
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let service = tokio::spawn(run_service(
+            source,
+            Arc::clone(&publisher),
+            config,
+            shutdown_rx,
+        ));
+
+        publisher.wait_for_attempts(2).await;
+        let _ = shutdown_tx.send(());
+
+        service.await.unwrap().unwrap();
+
+        assert_eq!(publisher.attempts().await, 2);
+        assert_eq!(publisher.successes().await, 1);
+    }
+
+    #[tokio::test]
+    async fn run_service_stops_when_shutdown_is_triggered() {
+        let source = FakeSource::new(vec![]);
+        let publisher = Arc::new(RecordingPublisher::new(Duration::from_millis(5)));
+        let config = ServiceConfig {
+            zmq_endpoint: "inproc://test".into(),
+            max_concurrent_sms: 1,
+        };
+
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let service = tokio::spawn(run_service(
+            source,
+            Arc::clone(&publisher),
+            config,
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = shutdown_tx.send(());
+
+        service.await.unwrap().unwrap();
+
+        assert!(publisher.messages().await.is_empty());
     }
 }

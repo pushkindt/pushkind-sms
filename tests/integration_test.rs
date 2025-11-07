@@ -18,7 +18,7 @@ fn zmq_message_serialization() {
 
     let serialized = serde_json::to_vec(&msg).unwrap();
     let deserialized: TestMessage = serde_json::from_slice(&serialized).unwrap();
-    
+
     assert_eq!(msg, deserialized);
 }
 
