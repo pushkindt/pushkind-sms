@@ -89,29 +89,32 @@ impl ZMQSendSmsMessage {
 }
 
 pub trait PublishClient: Send + Sync + 'static {
-    fn publish<'a>(
-        &'a self,
-        phone_number: &'a str,
-        message: &'a str,
-        attributes: Vec<(String, MessageAttributeValue)>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + 'a>>;
+    fn publish(
+        &self,
+        msg: ZMQSendSmsMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + '_>>;
 }
 
 impl PublishClient for Client {
-    fn publish<'a>(
-        &'a self,
-        phone_number: &'a str,
-        message: &'a str,
-        attributes: Vec<(String, MessageAttributeValue)>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + 'a>> {
+    fn publish(
+        &self,
+        msg: ZMQSendSmsMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + '_>> {
         let client = self.clone();
-        let phone_number = phone_number.to_owned();
-        let message = message.to_owned();
         Box::pin(async move {
+            let ZMQSendSmsMessage {
+                sender_id,
+                phone_number,
+                message,
+            } = msg;
+            let sender_attr = MessageAttributeValue::builder()
+                .data_type("String")
+                .string_value(sender_id)
+                .build()
+                .map_err(|e| ServiceError::Build(Box::new(e)))?;
+
             let mut request = client.publish().phone_number(phone_number).message(message);
-            for (key, value) in attributes {
-                request = request.message_attributes(key, value);
-            }
+            request = request.message_attributes("SenderID", sender_attr);
 
             request
                 .send()
@@ -138,21 +141,10 @@ async fn send_sms<C: PublishClient + ?Sized>(
 ) -> Result<(), ServiceError> {
     msg.validate()?;
 
-    let sender_id = MessageAttributeValue::builder()
-        .data_type("String")
-        .string_value(&msg.sender_id)
-        .build()
-        .map_err(|e| ServiceError::Build(Box::new(e)))?;
+    let masked_phone = msg.mask_phone();
+    client.publish(msg).await?;
 
-    client
-        .publish(
-            &msg.phone_number,
-            &msg.message,
-            vec![("SenderID".into(), sender_id)],
-        )
-        .await?;
-
-    log::info!("Published SMS to {}", msg.mask_phone());
+    log::info!("Published SMS to {}", masked_phone);
     Ok(())
 }
 
@@ -361,9 +353,7 @@ mod tests {
 
     #[derive(Clone)]
     struct PublishCall {
-        phone_number: String,
-        message: String,
-        attributes: Vec<(String, MessageAttributeValue)>,
+        message: ZMQSendSmsMessage,
     }
 
     #[derive(Clone, Default)]
@@ -387,22 +377,14 @@ mod tests {
     }
 
     impl PublishClient for MockPublishClient {
-        fn publish<'a>(
-            &'a self,
-            phone_number: &'a str,
-            message: &'a str,
-            attributes: Vec<(String, MessageAttributeValue)>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + 'a>> {
+        fn publish(
+            &self,
+            msg: ZMQSendSmsMessage,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + '_>> {
             let calls = Arc::clone(&self.calls);
             let error = Arc::clone(&self.error);
-            let phone_number = phone_number.to_owned();
-            let message = message.to_owned();
             Box::pin(async move {
-                calls.lock().await.push(PublishCall {
-                    phone_number,
-                    message,
-                    attributes,
-                });
+                calls.lock().await.push(PublishCall { message: msg });
                 if let Some(err) = error.lock().await.take() {
                     return Err(err);
                 }
@@ -412,7 +394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_sms_builds_sender_id_attribute() {
+    async fn send_sms_invokes_publish_with_message() {
         let client = MockPublishClient::new();
         let msg = ZMQSendSmsMessage {
             sender_id: "TEST".into(),
@@ -425,15 +407,7 @@ mod tests {
         let calls = client.calls().await;
         assert_eq!(calls.len(), 1);
         let call = &calls[0];
-        assert_eq!(call.phone_number, msg.phone_number);
-        assert_eq!(call.message, msg.message);
-        let sender_attr = call
-            .attributes
-            .iter()
-            .find(|(name, _)| name == "SenderID")
-            .expect("SenderID attribute missing");
-        assert_eq!(sender_attr.1.data_type(), "String");
-        assert_eq!(sender_attr.1.string_value().unwrap(), "TEST");
+        assert_eq!(call.message, msg);
     }
 
     #[tokio::test]
