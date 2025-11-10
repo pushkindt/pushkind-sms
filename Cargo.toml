@@ -15,3 +15,6 @@ thiserror = "2.0.17"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 phonenumber = "0.3"
+pushkind-common = { git = "https://github.com/pushkindt/pushkind-common.git", features = [
+    "sms",
+], branch = "main" }

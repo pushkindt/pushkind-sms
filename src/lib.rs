@@ -11,8 +11,7 @@ use std::{env, future::Future, pin::Pin, sync::Arc, time::Duration};
 use aws_config::BehaviorVersion;
 use aws_sdk_sns::{Client, types::MessageAttributeValue};
 use dotenvy::dotenv;
-use phonenumber::parse;
-use serde::{Deserialize, Serialize};
+use pushkind_common::models::sms::zmq::{ZMQSendSmsMessage, ZMQSendSmsValidationError};
 use thiserror::Error;
 use tokio::sync::{Semaphore, broadcast};
 
@@ -41,51 +40,7 @@ pub enum ServiceError {
     #[error("Build error")]
     Build(#[from] Box<aws_sdk_sns::error::BuildError>),
     #[error("Invalid message format: {0}")]
-    InvalidMessage(String),
-    #[error("Invalid phone number")]
-    InvalidPhoneNumber(#[from] phonenumber::ParseError),
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-/// JSON payload representing a request to send a single SMS message.
-///
-/// The payload is provided by the ZeroMQ producer and must contain a
-/// non-empty sender ID, a valid E.164-formatted phone number, and a message
-/// body. Validation ensures these requirements before any publish occurs.
-pub struct ZMQSendSmsMessage {
-    pub sender_id: String,
-    pub phone_number: String,
-    pub message: String,
-}
-
-impl ZMQSendSmsMessage {
-    pub fn validate(&self) -> Result<(), ServiceError> {
-        if self.sender_id.is_empty() {
-            return Err(ServiceError::InvalidMessage("sender_id is empty".into()));
-        }
-        let phone = parse(None, &self.phone_number)?;
-        if !phone.is_valid() {
-            return Err(ServiceError::InvalidPhoneNumber(
-                phonenumber::ParseError::NoNumber,
-            ));
-        }
-        if self.message.is_empty() {
-            return Err(ServiceError::InvalidMessage("message is empty".into()));
-        }
-        Ok(())
-    }
-
-    pub fn mask_phone(&self) -> String {
-        let mut s = self.phone_number.chars();
-
-        let keep_start = 4;
-
-        let mut out = String::new();
-        out.extend(s.by_ref().take(keep_start));
-        out.extend(std::iter::repeat_n('*', 6));
-        out.extend(s.skip(6));
-        out
-    }
+    InvalidMessage(#[from] ZMQSendSmsValidationError),
 }
 
 pub trait PublishClient: Send + Sync + 'static {
@@ -414,7 +369,9 @@ mod tests {
     async fn send_sms_propagates_publisher_errors() {
         let client = MockPublishClient::new();
         client
-            .set_error(ServiceError::InvalidMessage("publisher error".into()))
+            .set_error(ServiceError::InvalidMessage(
+                ZMQSendSmsValidationError::InvalidMessage("publisher error".into()),
+            ))
             .await;
         let msg = ZMQSendSmsMessage {
             sender_id: "TEST".into(),
@@ -425,7 +382,11 @@ mod tests {
         let err = send_sms(msg.clone(), &client)
             .await
             .expect_err("expected error");
-        assert!(matches!(err, ServiceError::InvalidMessage(ref m) if m == "publisher error"));
+        assert!(matches!(
+            err,
+            ServiceError::InvalidMessage(ZMQSendSmsValidationError::InvalidMessage(m))
+            if m == "publisher error"
+        ));
 
         let calls = client.calls().await;
         assert_eq!(calls.len(), 1);
@@ -450,7 +411,7 @@ mod tests {
         };
         assert!(matches!(
             msg.validate(),
-            Err(ServiceError::InvalidMessage(_))
+            Err(ZMQSendSmsValidationError::InvalidSender(_))
         ));
     }
 
@@ -463,7 +424,7 @@ mod tests {
         };
         assert!(matches!(
             msg.validate(),
-            Err(ServiceError::InvalidMessage(_))
+            Err(ZMQSendSmsValidationError::InvalidMessage(_))
         ));
     }
 
@@ -476,7 +437,7 @@ mod tests {
         };
         assert!(matches!(
             msg.validate(),
-            Err(ServiceError::InvalidPhoneNumber(_))
+            Err(ZMQSendSmsValidationError::InvalidPhoneNumber(_))
         ));
     }
 
@@ -667,7 +628,9 @@ mod tests {
                 guard.attempts += 1;
                 if guard.failures_remaining > 0 {
                     guard.failures_remaining -= 1;
-                    return Err(ServiceError::InvalidMessage("forced failure".into()));
+                    return Err(ServiceError::InvalidMessage(
+                        ZMQSendSmsValidationError::InvalidMessage("forced failure".into()),
+                    ));
                 }
                 guard.successes += 1;
                 Ok(())
