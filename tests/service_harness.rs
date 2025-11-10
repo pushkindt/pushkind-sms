@@ -1,9 +1,8 @@
+use pushkind_common::models::sms::zmq::{ZMQSendSmsMessage, ZMQSendSmsValidationError};
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
-
-use pushkind_sms::{
-    MessageSource, ServiceConfig, ServiceError, SmsPublisher, ZMQSendSmsMessage, run_service,
-};
 use tokio::sync::{Mutex, broadcast};
+
+use pushkind_sms::{MessageSource, ServiceConfig, ServiceError, SmsPublisher, run_service};
 
 struct StubSource {
     messages: Vec<Vec<u8>>,
@@ -141,7 +140,9 @@ impl SmsPublisher for FlakyPublisher {
             guard.attempts += 1;
             if guard.failures_remaining > 0 {
                 guard.failures_remaining -= 1;
-                return Err(ServiceError::InvalidMessage("forced failure".into()));
+                return Err(ServiceError::InvalidMessage(
+                    ZMQSendSmsValidationError::InvalidMessage("forced failure".into()),
+                ));
             }
             guard.successes += 1;
             Ok(())

@@ -1597,6 +1597,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pushkind-common"
+version = "0.1.0"
+source = "git+https://github.com/pushkindt/pushkind-common.git?branch=main#8c288d1c545c1e609120f63ab8dc2ff7541c7c60"
+dependencies = [
+ "phonenumber",
+ "serde",
+ "thiserror 2.0.17",
+ "url",
+]
+
+[[package]]
 name = "pushkind-sms"
 version = "0.1.0"
 dependencies = [
@@ -1606,6 +1617,7 @@ dependencies = [
  "env_logger",
  "log",
  "phonenumber",
+ "pushkind-common",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
